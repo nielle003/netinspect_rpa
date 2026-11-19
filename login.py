@@ -765,7 +765,7 @@ def get_pending_parts(po_col):
         f"ORDER BY CASE "
         f"WHEN UPPER(TRIM({c_num})) LIKE 'XP%' THEN 0 "
         f"WHEN UPPER(TRIM({c_num})) LIKE 'XA%' THEN 1 "
-        f"ELSE 2 END, {c_num} ASC"
+        f"ELSE 2 END, {c_num} DESC"
     )
     # New Vincent Code End: November 11, 2026
     if DB_LIMIT > 0:

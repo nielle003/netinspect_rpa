@@ -39,7 +39,10 @@ from login import (
     save_screenshot,
     settle,
     wait_enabled,
+    get_conn,
 )
+
+from notify_not_registered import send_notification
 
 DIALOG_TEXT = "is not set up within"
 # New Vincent Code Start: November 4, 2026
@@ -351,6 +354,12 @@ def handle_unknown_part(page, ctx, box, part):
             fill_field(ctx, "Part Name", "Form 1, Field 2", part.name)
         except Exception as e:
             print(f"Could not fill Part Name ({type(e).__name__}).")
+    #nielle added notfication
+    notification = send_notification(get_conn(), part)
+    if notification:
+        print("Notification sent successfully.")
+    else:
+        print("Notification not sent.")
     print("CREATE FAIR not clicked (the part is not at the customer).")
     return status
 
