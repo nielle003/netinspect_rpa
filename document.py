@@ -40,13 +40,30 @@ def _int_env(name, default):
 
 
 DOCUMENT_UPLOAD_WAIT = _int_env("DOCUMENT_UPLOAD_WAIT", 120)
-
+# Seconds with no new upload request (and nothing in flight) before the upload
+# is considered finished. Net-Inspect starts its requests in waves, so a
+# single moment of "nothing running" is not enough.
+DOCUMENT_QUIET = _int_env("DOCUMENT_QUIET", 3)
 SELECT_FILES_RE = re.compile(r"select\s+files", re.I)
 UPLOAD_BUTTON_RE = re.compile(r"^\s*UPLOAD\s*$")
 SKIP_FILES = ("thumbs.db", "desktop.ini")
 WRITE_METHODS = ("POST", "PUT", "PATCH")
 
-_TRACK = {"started": 0, "finished": 0, "responses": []}
+_TRACK = {
+    "started": 0,
+    "finished": 0,
+    "failed": [],
+    "responses": [],
+    "last_activity": 0.0,
+}
+
+
+def _reset_track():
+    _TRACK["started"] = 0
+    _TRACK["finished"] = 0
+    _TRACK["failed"] = []
+    _TRACK["responses"] = []
+    _TRACK["last_activity"] = time.monotonic()
 
 
 def _is_upload_request(req):
@@ -62,23 +79,43 @@ def _is_upload_request(req):
 def _on_request(req):
     if _is_upload_request(req):
         _TRACK["started"] += 1
+        _TRACK["last_activity"] = time.monotonic()
 
 
 def _on_finished(req):
     if _is_upload_request(req):
         _TRACK["finished"] += 1
+        _TRACK["last_activity"] = time.monotonic()
+
+
+def _on_failed(req):
+    if _is_upload_request(req):
+        _TRACK["finished"] += 1
+        _TRACK["last_activity"] = time.monotonic()
+        try:
+            reason = req.failure
+            if callable(reason):
+                reason = reason()
+        except Exception:
+            reason = "unknown"
+        _TRACK["failed"].append((req.url, str(reason)))
 
 
 def _on_response(resp):
     try:
         if _is_upload_request(resp.request):
             _TRACK["responses"].append((resp.status, resp.url))
+            _TRACK["last_activity"] = time.monotonic()
     except Exception:
         pass
 
 
 def _uploads_idle():
     return _TRACK["finished"] >= _TRACK["started"]
+
+
+def _quiet_for(seconds):
+    return _uploads_idle() and (time.monotonic() - _TRACK["last_activity"]) >= seconds
 
 
 def lot_for(part):
@@ -281,6 +318,7 @@ def click_upload(page, ctx):
     if not wait_enabled(page, target, patient(15)):
         raise RuntimeError("the UPLOAD button stayed disabled")
     started_before = _TRACK["started"]
+    _TRACK["last_activity"] = time.monotonic()
     target.click(timeout=T(5000))
     print("  Clicked UPLOAD.")
     return started_before
@@ -290,48 +328,70 @@ def wait_upload_finished(page, started_before, expected_total):
     if not poll(page, lambda: _TRACK["started"] > started_before, 20, 200):
         print("  No upload request was seen after clicking UPLOAD.")
     print(
-        f"  Upload in progress: {_TRACK['started'] - started_before} request(s) started."
+        f"  Upload in progress: {_TRACK['started'] - started_before} request(s) started so far."
     )
 
+    # Finished = nothing in flight, no new request for DOCUMENT_QUIET seconds,
+    # and no progress bar. Net-Inspect starts requests in waves, so "nothing
+    # running right now" alone is NOT proof that everything was sent.
     def finished():
-        if not _uploads_idle():
-            return False
-        if not progress_visible(page):
-            return True
-        count = doc_count(page)
-        return count is not None and count >= expected_total
+        return _quiet_for(DOCUMENT_QUIET) and not progress_visible(page)
 
     if not poll(page, finished, DOCUMENT_UPLOAD_WAIT, 300):
         raise RuntimeError(
             f"the upload is still running after {DOCUMENT_UPLOAD_WAIT} seconds"
         )
-    page.wait_for_timeout(1500)
-    if not poll(page, _uploads_idle, DOCUMENT_UPLOAD_WAIT, 300):
-        raise RuntimeError("an upload request is still running")
+    print(
+        f"  Upload quiet: {_TRACK['started']} request(s) started, "
+        f"{_TRACK['finished']} finished, {len(_TRACK['failed'])} failed."
+    )
     settle(page)
 
 
 def verify_uploaded(page, staged, expected_total):
-    bad = [(s, u) for s, u in _TRACK["responses"] if not 200 <= s < 300]
     for status, url in _TRACK["responses"]:
         print(f"  Upload request: HTTP {status}  {url.split('/api/v1/')[-1][:120]}")
+
+    if _TRACK["failed"]:
+        for url, reason in _TRACK["failed"]:
+            print(
+                f"  Upload request FAILED: {reason}  {url.split('/api/v1/')[-1][:120]}"
+            )
+        raise RuntimeError(
+            f"{len(_TRACK['failed'])} upload request(s) failed: {_TRACK['failed'][:3]}"
+        )
+
+    bad = [(s, u) for s, u in _TRACK["responses"] if not 200 <= s < 300]
     if bad:
         raise RuntimeError(f"{len(bad)} upload request(s) were rejected: {bad[:3]}")
-    names = [p.name for p in staged]
-    count = None
+    count = doc_count(page)
+    if count is None:
+        # No counter on the page at all: the only thing we can say is that
+        # every request answered 2xx and none failed.
+        print("  Document counter not found; relying on the request results.")
+        return
 
-    def confirmed():
+    def counter_ok():
         nonlocal count
         count = doc_count(page)
-        if count is not None and count >= expected_total:
-            return True
-        return all(file_shown(page, n) for n in names) and not progress_visible(page)
+        return count is not None and count >= expected_total
 
-    if not poll(page, confirmed, 20, 500):
-        raise RuntimeError(
-            f"the upload is not confirmed: document counter shows {count}, expected {expected_total}"
+    if not poll(page, counter_ok, 20, 500):
+        # The counter may only refresh on reload.
+        print(
+            f"  Counter shows {count}, expected {expected_total}; reloading to re-check."
         )
-    print(f"  Upload confirmed: document counter shows {doc_count(page)}.")
+        try:
+            page.reload()
+            settle(page)
+        except Exception as e:
+            print(f"  Reload failed: {type(e).__name__}: {e}")
+        if not poll(page, counter_ok, 20, 500):
+            raise RuntimeError(
+                f"the upload is not confirmed: document counter shows {count}, "
+                f"expected {expected_total}"
+            )
+    print(f"  Upload confirmed: document counter shows {count}.")
 
 
 def upload_documents(page, part):
@@ -358,12 +418,10 @@ def upload_documents(page, part):
     before = doc_count(page) or 0
     expected_total = before + len(files)
     stage_dir = tempfile.mkdtemp(prefix="fair_docs_")
-    _TRACK["started"] = 0
-    _TRACK["finished"] = 0
-    _TRACK["responses"] = []
+    _reset_track()
     page.on("request", _on_request)
     page.on("requestfinished", _on_finished)
-    page.on("requestfailed", _on_finished)
+    page.on("requestfailed", _on_failed)
     page.on("response", _on_response)
     try:
         staged = stage_files(files, stage_dir)
@@ -379,23 +437,34 @@ def upload_documents(page, part):
         print(f"  Documents failed: {type(e).__name__}: {str(e).strip()[:400]}")
         save_screenshot(page, f"documents_error_{part.number}")
         return False
+    # Chromium reads the selected files lazily while uploading. Never
+    # delete them while a request may still be reading them. The
+    # listeners must stay attached until then, or _TRACK stops updating.
     finally:
+        quiet = poll(page, lambda: _quiet_for(2), 15, 300)
         for event, handler in (
             ("request", _on_request),
             ("requestfinished", _on_finished),
-            ("requestfailed", _on_finished),
+            ("requestfailed", _on_failed),
             ("response", _on_response),
         ):
             try:
                 page.remove_listener(event, handler)
             except Exception:
                 pass
-        shutil.rmtree(stage_dir, ignore_errors=True)
+        if quiet:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+        else:
+            print(
+                f"  Upload still active; leaving the temporary folder in place: {stage_dir}"
+            )
 
 
 def run_documents(page, part, status):
     if not FILL_DOCUMENTS:
-        print("  Documents NOT run: FILL_DOCUMENTS is off. Add FILL_DOCUMENTS=true to .env.")
+        print(
+            "  Documents NOT run: FILL_DOCUMENTS is off. Add FILL_DOCUMENTS=true to .env."
+        )
         return run_checklist(page, part, status)
     if not upload_documents(page, part):
         print("  Checklist NOT opened: the document upload did not finish.")
