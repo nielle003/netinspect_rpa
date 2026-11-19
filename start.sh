@@ -1,6 +1,7 @@
 #!/bin/bash
 # Starts the virtual screen, optionally a viewer for it, then your script.
 export DISPLAY=:99
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 
 # 1. Virtual screen (same size as before)
 Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
