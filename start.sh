@@ -4,7 +4,8 @@ export DISPLAY=:99
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 
 # 1. Virtual screen (same size as before)
-Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+SCREEN_SIZE="${SCREEN_SIZE:-1440x810}"
+Xvfb :99 -screen 0 ${SCREEN_SIZE}x24 -nolisten tcp &
 sleep 2
 
 # 2. Viewer: lets you watch the browser at http://localhost:6080
